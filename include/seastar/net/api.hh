@@ -181,6 +181,7 @@ struct session_dn {
 struct cert_info {
     std::vector<std::byte> serial;
     time_t expiry;
+    bool valid{true};
 };
 
 /// A TCP (or other stream-based protocol) connection.

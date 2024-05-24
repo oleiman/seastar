@@ -34,7 +34,7 @@ include(CMakeParseArguments)
 # This is required because cmake-boost may return to Boost_{component}_LIBRARY:
 # - /usr/lib64/libboost_foo.so
 # - Boost::foo
-set (Boost_NO_BOOST_CMAKE ON)
+set (Boost_NO_BOOST_CMAKE OFF)
 
 if (CMAKE_CXX_STANDARD LESS 20)
   set (_seastar_boost_version 1.64.0)

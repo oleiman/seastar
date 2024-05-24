@@ -42,6 +42,7 @@ module;
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 #include <seastar/util/defer.hh>
+#include <iostream>
 
 #ifdef SEASTAR_MODULE
 module seastar;
@@ -182,6 +183,25 @@ static std::vector<std::byte> extract_x509_serial(gnutls_x509_crt_t cert) {
     gtls_chk(gnutls_x509_crt_get_serial(cert, serial.data(), &serial_size));
     serial.resize(serial_size);
     return serial;
+}
+
+  static bool check_x509_valid(gnutls_x509_trust_list_t trust_list, gnutls_x509_crt_t *cert, unsigned int crt_list_size) {
+    unsigned int verify_out;
+    auto result = gnutls_x509_trust_list_verify_crt(trust_list, cert, crt_list_size, 0, &verify_out, NULL);
+
+    // verify failed outright, call the cert invalid
+    if (result != 0) {
+      std::cout << "OOPSIE" << std::endl;
+      return false;
+    }
+
+    // cert is invalid becuase it was revoked
+    if (verify_out & GNUTLS_CERT_INVALID && verify_out & GNUTLS_CERT_REVOKED) {
+      std::cout << "REVOKED!" << std::endl;
+      return false;
+    }
+    return true;
+      
 }
 
 namespace {
@@ -361,6 +381,11 @@ public:
                 if (xcred == nullptr) {
                     throw std::bad_alloc();
                 }
+                int flags = gnutls_certificate_get_verify_flags(xcred);
+                std::cout << "FLAGS: " << (flags
+                                           ) << std::endl;
+                gnutls_certificate_set_verify_flags(
+                    xcred, flags & ~GNUTLS_VERIFY_DISABLE_CRL_CHECKS);
                 return xcred;
             }()), _priority(nullptr, &gnutls_priority_deinit)
     {}
@@ -411,6 +436,9 @@ public:
             gnutls_free(crt_list);
         });
 
+        gnutls_x509_trust_list_t tlist{};
+        gnutls_certificate_get_trust_list(*this, &tlist);
+
         std::vector<cert_info> result;
         result.reserve(crt_list_size);
 
@@ -418,6 +446,7 @@ public:
             cert_info info = {
                 .serial = extract_x509_serial(crt_list[i]),
                 .expiry = gnutls_x509_crt_get_expiration_time(crt_list[i]),
+                .valid = check_x509_valid(tlist, &crt_list[i], 1), // list size exactly one becuase we're iterating?
             };
             result.emplace_back(std::move(info));
         }
@@ -436,6 +465,7 @@ public:
             cert_info info = {
                 .serial = extract_x509_serial(cert),
                 .expiry = gnutls_x509_crt_get_expiration_time(cert),
+                .valid = check_x509_valid(tlist, &cert, 1), // list size is exactly one because it's a CA in a chain?
             };
             result.emplace_back(std::move(info));
             gnutls_x509_crt_deinit(cert);
@@ -756,6 +786,7 @@ void tls::credentials_builder::apply_to(certificate_credentials& creds) const {
             if (key == x509_trust_key) {
                 creds.set_x509_trust(info.data, info.format);
             } else if (key == x509_crl_key) {
+              std::cout << "RELOADING CRL" << std::endl;
                 creds.set_x509_crl(info.data, info.format);
             }
         },
@@ -1341,12 +1372,15 @@ public:
         auto res = gnutls_certificate_verify_peers3(*this, _type != type::CLIENT || _options.server_name.empty()
                         ? nullptr : _options.server_name.c_str(), &status);
         if (res == GNUTLS_E_NO_CERTIFICATE_FOUND && _type != type::CLIENT && _creds->get_client_auth() != client_auth::REQUIRE) {
+            std::cout << "IGNORED" << std::endl;
             return;
         }
         if (res < 0) {
+            std::cout << "WOOOOOOHOOO " << res << std::endl;
             throw std::system_error(res, error_category());
         }
-        if (status & GNUTLS_CERT_INVALID) {
+        std::cout << "STATUS " << status << std::endl;
+        if (status & GNUTLS_CERT_INVALID || status & GNUTLS_CERT_REVOKED) {
             auto stat_str = cert_status_to_string(gnutls_certificate_type_get(*this), status);
             auto dn = extract_dn_information();
 
