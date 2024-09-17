@@ -40,14 +40,19 @@ module;
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 
+#include <cassert>
+#include <chrono>
+#include <functional>
 #include <span>
 #include <system_error>
+#include <unordered_set>
+#include <utility>
+
+#include <netinet/in.h>
 
 #ifdef SEASTAR_MODULE
 module seastar;
 #else
-#include "net/tls-impl.hh"
-
 #include <seastar/core/gate.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/with_timeout.hh>
@@ -56,6 +61,8 @@ module seastar;
 #include <seastar/util/defer.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/log.hh>
+
+#include "net/tls-impl.hh"
 #endif
 
 namespace seastar {
@@ -162,26 +169,6 @@ sstring asn1_str_to_str(T* asn1) {
     const auto len = ASN1_STRING_length(asn1);
     return sstring(reinterpret_cast<const char*>(ASN1_STRING_get0_data(asn1)), len);
 };
-
-static std::vector<std::byte> extract_x509_serial(X509* cert) {
-    constexpr size_t serial_max = 160;
-    const ASN1_INTEGER *serial_no = X509_get_serialNumber(cert);
-    const size_t serial_size = std::min(serial_max, (size_t)serial_no->length);
-    std::vector<std::byte> serial(
-        reinterpret_cast<std::byte*>(serial_no->data),
-        reinterpret_cast<std::byte*>(serial_no->data + serial_size));
-    return serial;
-}
-
-static time_t extract_x509_expiry(X509* cert) {
-    const ASN1_TIME *not_after = X509_get0_notAfter(cert);
-    if (not_after != nullptr) {
-        tm tm_struct{};
-        ASN1_TIME_to_tm(not_after, &tm_struct);
-        return mktime(&tm_struct);
-    }
-    return -1;
-}
 
 template<typename T, auto fn>
 struct ssl_deleter {
@@ -523,34 +510,6 @@ public:
 
     void dh_params(const tls::dh_params&) {}
 
-    std::vector<cert_info> get_x509_info() const {
-        if (_cert_and_key.cert) {
-            return {
-                cert_info{
-                    .serial = extract_x509_serial(_cert_and_key.cert.get()),
-                    .expiry = extract_x509_expiry(_cert_and_key.cert.get())}
-            };
-        }
-        return {};
-    }
-
-    std::vector<cert_info> get_x509_trust_list_info() const {
-        std::vector<cert_info> cert_infos;
-        STACK_OF(X509_OBJECT) *chain = X509_STORE_get0_objects(_creds.get());
-        auto num_elements = sk_X509_OBJECT_num(chain);
-        for (auto i=0; i < num_elements; i++) {
-            auto object = sk_X509_OBJECT_value(chain, i);
-            auto type = X509_OBJECT_get_type(object);
-            if (type == X509_LU_X509) {
-                auto cert = X509_OBJECT_get0_X509(object);
-                cert_infos.push_back(cert_info{
-                        .serial = extract_x509_serial(cert),
-                        .expiry = extract_x509_expiry(cert)});
-            }
-        }
-        return cert_infos;
-    }
-
     void set_client_auth(client_auth ca) {
         _client_auth = ca;
     }
@@ -716,32 +675,6 @@ void tls::certificate_credentials::set_maximum_tls_version(tls_version version) 
 
 void tls::certificate_credentials::set_dn_verification_callback(dn_callback cb) {
     _impl->set_dn_verification_callback(std::move(cb));
-}
-
-std::optional<std::vector<cert_info>> tls::certificate_credentials::get_cert_info() const noexcept {
-    if (_impl == nullptr) {
-        return std::nullopt;
-    }
-
-    try {
-        auto result = _impl->get_x509_info();
-        return result;
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
-std::optional<std::vector<cert_info>> tls::certificate_credentials::get_trust_list_info() const noexcept {
-    if (_impl == nullptr) {
-        return std::nullopt;
-    }
-
-    try {
-        auto result = _impl->get_x509_trust_list_info();
-        return result;
-    } catch (...) {
-        return std::nullopt;
-    }
 }
 
 void tls::certificate_credentials::enable_load_system_trust() {
@@ -1403,7 +1336,7 @@ public:
         // only do once.
         if (!std::exchange(_shutdown, true)) {
             // running in background. try to bye-handshake us nicely, but after 10s we forcefully close.
-            (void)with_timeout(
+            engine().run_in_background(with_timeout(
               timer<>::clock::now() + std::chrono::seconds(10), shutdown())
               .finally([this] {
                   _eof = true;
@@ -1418,7 +1351,7 @@ public:
                       return with_semaphore(_out_sem, 1, [] { });
                   });
               }).handle_exception([me = shared_from_this()](std::exception_ptr){
-              }).discard_result();
+              }).discard_result());
         }
     }
     // helper for sink
